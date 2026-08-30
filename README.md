@@ -63,6 +63,10 @@ python rename_rb_files.pyw [--dir PATH] [--dry-run] [--no-collisions]
    parsing `songs.dta` inside the package if needed.
 3. The name is sanitized (illegal filename characters and periods are
    stripped) and the file is renamed. PS3 PKGs keep their `.pkg` extension.
+
+> Accented / special characters are preserved (`Naïve`, `¡Viva la Gloria!`):
+> `songs.dta` is decoded as UTF-8 with a Windows-1252 fallback, and a mangled
+> STFS header is ignored in favor of the accented title inside the package.
 4. After renaming, files that collide with a `Name (2)`-style copy are grouped
    by canonical name. The largest / most recently modified file wins and is
    kept (renamed to the clean name); the rest are moved to `bkp/`.

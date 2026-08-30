@@ -54,7 +54,36 @@ def read_header_display_name(path):
         f.seek(DISPLAYNAME_OFFSET)
         raw = f.read(_UCHAR80_SIZE)
     name = raw.decode('utf-16-be', errors='replace')
-    return name.strip('\x00 \t\r\n')
+    name = name.strip('\x00 \t\r\n')
+    # A misread header shows up as U+FFFD replacement characters; treat it as
+    # "no usable name" so the caller falls back to songs.dta / ArcadeInfo.xml,
+    # which preserve accented characters like ï and ¡.
+    if '\ufffd' in name:
+        return ''
+    return name
+
+
+def _decode_text(raw):
+    """Decode a package text blob, preserving accented characters.
+
+    Rock Band songs.dta files aren't always UTF-8 - many are single-byte
+    Windows-1252. Try strict UTF-8 first so real Unicode survives; on any
+    failure (or when the result is full of U+FFFD replacement chars from a
+    masked bad decode) fall back to Windows-1252, which maps every byte 1:1
+    and never drops characters like ï (0xEF) or ¡ (0xA1).
+    """
+    try:
+        text = raw.decode('utf-8')
+        if '\ufffd' not in text:
+            return text
+    except UnicodeDecodeError:
+        pass
+    return raw.decode('cp1252', errors='replace')
+
+
+def _is_ascii(text):
+    """True when a string contains only ASCII characters."""
+    return all(ord(c) < 128 for c in text)
 
 
 def _parse_stfs_header(path):
@@ -172,7 +201,7 @@ def read_contents_name(path):
 
         if lower == "songs.dta":
             raw = _read_entry_bytes(path, e, start, offset)
-            text = raw.decode('utf-8', errors='replace')
+            text = _decode_text(raw)
             name = _parse_dta_artist_name(text)
             if name:
                 return name
@@ -181,13 +210,18 @@ def read_contents_name(path):
             raw = _read_entry_bytes(path, e, start, offset)
             try:
                 root = ET.fromstring(raw)
-                for elem in root.iter():
-                    if elem.tag.lower() in ("name", "title", "displayname"):
-                        text = (elem.text or "").strip()
-                        if text:
-                            return text
             except Exception:
-                pass
+                # Latin-1/Windows-1252 XML without a declaration - decode and
+                # re-parse so accented characters aren't lost.
+                try:
+                    root = ET.fromstring(_decode_text(raw))
+                except Exception:
+                    continue
+            for elem in root.iter():
+                if elem.tag.lower() in ("name", "title", "displayname"):
+                    text = (elem.text or "").strip()
+                    if text:
+                        return text
 
     return None
 
@@ -222,15 +256,23 @@ def read_ascii_scan_name(path, start=0x300, end=0xD00):
 def get_stfs_real_name(path):
     """Return the real display name for an STFS package, or None."""
     try:
-        name = read_header_display_name(path)
-        if name:
-            return name
+        header_name = read_header_display_name(path)
     except Exception:
-        pass
+        header_name = None
 
-    name = read_contents_name(path)
-    if name:
-        return name
+    # When the header is missing or only holds the ASCII form, look inside the
+    # package: songs.dta / ArcadeInfo.xml carry the real accented title.
+    if not header_name or _is_ascii(header_name):
+        contents_name = read_contents_name(path)
+        if contents_name:
+            # Prefer the contents name when it keeps accented characters the
+            # ASCII header dropped, e.g. "Naïve", "¡Viva la Gloria!".
+            if not header_name or not _is_ascii(contents_name):
+                return contents_name
+            return header_name
+
+    if header_name:
+        return header_name
 
     return read_ascii_scan_name(path)
 
@@ -373,7 +415,7 @@ def read_pkg_contents_name(path):
             with open(path, 'rb') as f:
                 raw = _pkg_crypt_slice(f, header['qa_digest'],
                                        header['data_off'], e['foff'], e['size'])
-            text = raw.decode('utf-8', errors='replace')
+            text = _decode_text(raw)
             name = _parse_dta_artist_name(text)
             if name:
                 return name

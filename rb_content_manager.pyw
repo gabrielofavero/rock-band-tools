@@ -107,6 +107,24 @@ def folder_size(path):
     return total
 
 
+def _decode_text(raw):
+    """Decode a Songs.dta blob, preserving accented characters.
+
+    Rock Band Songs.dta files aren't always UTF-8 - many are single-byte
+    Windows-1252. Try strict UTF-8 first so real Unicode survives; on any
+    failure (or when the result is full of U+FFFD replacement chars from a
+    masked bad decode) fall back to Windows-1252, which maps every byte 1:1
+    and never drops characters like ï (0xEF) or ¡ (0xA1).
+    """
+    try:
+        text = raw.decode('utf-8')
+        if '\ufffd' not in text:
+            return text
+    except UnicodeDecodeError:
+        pass
+    return raw.decode('cp1252', errors='replace')
+
+
 def read_dta_songs(dta_path):
     """Extract [(name, artist), ...] pairs from a Songs.dta file.
 
@@ -115,7 +133,7 @@ def read_dta_songs(dta_path):
     """
     try:
         raw = open(dta_path, 'rb').read()
-        txt = raw.decode('utf-8', errors='replace')
+        txt = _decode_text(raw)
     except OSError:
         return []
     # findall on the backreference pattern returns (quote, value) tuples
