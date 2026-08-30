@@ -204,7 +204,7 @@ class App:
     def clear_log(self):
         self.text.delete('1.0', 'end')
 
-    def _log(self, string):
+    def _log(self, string=''):
         if not string:
             string = '\n'
         try:
