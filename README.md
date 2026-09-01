@@ -80,12 +80,19 @@ Helps you see and clean up the Rock Band content installed in an RPCS3 HDD's
 
 ## What it does
 
-- Scans `C:\Games\Emulators\RPCS3\dev_hdd0\game` (or any folder you pick).
-- For each **Rock Band** game it finds (matched by its `PARAM.SFO` title, e.g.
-  `Rock Band`, `Rock Band 3`, `Rock Band Blitz`, `The Beatles: Rock Band`),
-  it shows the game's id, the song packages / exports / licenses inside its
-  `USRDIR`, the real **Artist - Song** names (read from each package's
-  `Songs.dta`), and each item's size.
+- Scans `C:\Games\Emulators\RPCS3\dev_hdd0\game` (or any folder you pick) and
+  lists only **Rock Band** content (matched by the `PARAM.SFO` title).
+- For each Rock Band game it shows the song packages / exports / licenses
+  inside its `USRDIR`, the real **Artist - Song** names (read from each
+  package's `Songs.dta`), and each item's size.
+- Each game is labeled with its **official name**, looked up from
+  SerialStation's PS3 title-id database (`https://serialstation.com`), so the
+  correct name is shown for every PS3 id.
+- **Search box**: type an artist, a song, or an `Artist - Song` combination and
+  the list filters live - including songs that live inside a pack.
+- **Duplications are highlighted in yellow**: any item whose song also exists
+  in another item (e.g. a track pack *and* a standalone DLC) is tinted yellow.
+- **Show duplications only** checkbox narrows the list to those items.
 - You can mark **one item, a whole game's content, or everything** for
   deletion. Marked items are moved to the **Windows Recycle Bin** (reversible),
   never deleted permanently.
@@ -102,17 +109,22 @@ Optional CLI arguments:
 | Option | Description |
 | --- | --- |
 | `--dir PATH` | Open a specific game directory (skips the default / picker) |
-| `--show-all` | Start with the "Only Rock Band content" filter turned off (shows every game, non-Rock Band entries greyed out) |
 
 ## Controls
 
 | Control | What it does |
 | --- | --- |
+| `Search` box | Filters the tree as you type (artist, song, or `Artist - Song`; matches inside packs too) |
+| `Show duplications only` | Shows only items whose songs also appear in another item |
 | `Mark` column | Click the ☐/☑ cell on a song to mark/unmark it; click a game's cell to mark/unmark all of its songs |
 | `Select all` / `Select none` | Mark / unmark everything |
 | `Delete marked (Recycle Bin)` | Confirms first, then moves marked content (and any marked whole games) to the Recycle Bin |
-| Right-click a row | Open the folder in Explorer, toggle its mark, or delete the entire game |
+| Right-click a row | Open the folder in Explorer, toggle its mark, **Show duplicated items**, or delete the entire game |
 | Double-click a song row | Open that song's folder in Explorer |
+
+**Show duplicated items** (right-click menu) selects the next item that
+shares a song with the one you clicked; each further click cycles through all
+the duplicates so you can review them one by one.
 
 Only folders in a game's `USRDIR` are treated as content; the game engine
 folder (`gen`) and loose files (`EBOOT.BIN`, `.dta`, etc.) are left alone.

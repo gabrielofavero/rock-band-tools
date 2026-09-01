@@ -8,11 +8,10 @@ exports / licenses inside each game's USRDIR (with real song names read from
 Recycle Bin, so it's reversible).
 
 Double-click to run. Optional CLI usage:
-    rb_content_manager.pyw [--dir PATH] [--show-all]
+    rb_content_manager.pyw [--dir PATH]
 
     --dir PATH      game directory to open (default:
                     C:\\Games\\Emulators\\RPCS3\\dev_hdd0\\game)
-    --show-all      start with the "Only Rock Band content" filter off
 """
 
 import os
@@ -21,6 +20,7 @@ import re
 import struct
 import sys
 import threading
+from itertools import zip_longest
 
 # tkinter is bundled with the standard Windows CPython build
 try:
@@ -42,24 +42,65 @@ SYSTEM_GAME_DIRS = {'locks'}
 
 # Rock Band family titles all contain "rock band"
 # (Rock Band, Rock Band 2/3, Rock Band Blitz, The Beatles: Rock Band,
-#  Green Day: Rock Band, Rock Band 4 ...). Fallback id list is used when the
-# PARAM.SFO is missing / unreadable.
+#  Green Day: Rock Band, ...).
 RB_TITLE_KEYWORDS = ('rock band',)
-KNOWN_RB_IDS = {
+
+# Official/original game name for each PS3 Rock Band title id, taken from
+# SerialStation's database (https://serialstation.com). Keys are the folder
+# ids RPCS3 uses (serial with the dash removed). This lets the app show the
+# correct original name for each game instead of relying only on the (often
+# modded) PARAM.SFO title.
+GAME_ID_ORIGINAL_NAMES = {
     # Rock Band
-    'BLUS30050', 'BLES00532', 'NPUA30005',
+    'BLUS30050': 'Rock Band',
+    'BLES00228': 'Rock Band',
     # Rock Band 2
-    'BLUS30282', 'BLES00986', 'NPUB30000',
+    'BLUS30147': 'Rock Band 2',
+    'BLES00385': 'Rock Band 2',
     # Rock Band 3
-    'BLUS30463', 'BLES01103', 'NPUB30506',
+    'BLUS30463': 'Rock Band 3',
+    'BLES00986': 'Rock Band 3',
+    'BLES01611': 'Rock Band 3',
+    'BLAS50254': 'Rock Band 3',
     # Rock Band Blitz
-    'NPUB30749', 'NPEB00737',
+    'NPUB30749': 'Rock Band Blitz',
+    'NPEB00988': 'Rock Band Blitz',
     # The Beatles: Rock Band
-    'BLUS30359', 'BLES00808', 'NPUB30434',
+    'BLUS30282': 'The Beatles: Rock Band',
+    'BLES00532': 'The Beatles: Rock Band',
+    'BLUS30414': 'The Beatles: Rock Band',
+    'BLUS30423': 'The Beatles: Rock Band',
     # Green Day: Rock Band
-    'BLUS30439', 'BLES01043', 'NPUB30531',
-    # Rock Band 4 (PS4)
-    'BLUS31654',
+    'BLUS30350': 'Green Day: Rock Band',
+    'BLES00787': 'Green Day: Rock Band',
+    'BLAS50214': 'Green Day: Rock Band',
+    'BLUS30573': 'Green Day: Rock Band Plus',
+    'NPUB90411': 'Green Day: Rock Band (Demo)',
+    # LEGO Rock Band
+    'BLUS30382': 'LEGO Rock Band',
+    'BLES00636': 'LEGO Rock Band',
+    # AC/DC Live: Rock Band
+    'BLUS30235': 'AC/DC Live: Rock Band Track Pack',
+    'BLES00453': 'AC/DC Live: Rock Band',
+    # Track packs
+    'BLUS30195': 'Rock Band: Track Pack Volume 2',
+    'BLUS30327': 'Rock Band Track Pack: Classic Rock',
+    'BLUS30351': 'Rock Band: Country Track Pack',
+    'BLUS30623': 'Rock Band: Country Track Pack 2',
+    'BLUS30352': 'Rock Band: Metal Track Pack',
+    'BLES00451': 'Rock Band: Song Pack 2',
+    # Demo / misc
+    'BLUD80001': 'Rock Band (Trade Demo)',
+}
+
+# Fallback id list used when the PARAM.SFO is missing / unreadable.
+# It contains the SerialStation ids above plus a few legacy ids seen on
+# modded installs that do not appear in the database.
+KNOWN_RB_IDS = set(GAME_ID_ORIGINAL_NAMES) | {
+    'NPUA30005', 'NPUB30000', 'NPUB30506',
+    'NPEB00737', 'NPUB30434', 'NPUB30531',
+    'BLUS30359', 'BLES00808', 'BLES01103', 'BLES01043',
+    'BLUS30439', 'BLUS31654',
 }
 
 # Fields in Songs.dta use quoted values; keys may be bare or single-quoted:
@@ -129,24 +170,20 @@ def read_dta_songs(dta_path):
     """Extract [(name, artist), ...] pairs from a Songs.dta file.
 
     The `(name "...")` token also appears for the song file path
-    (e.g. "songs/foo/foo"); those are filtered out.
+    (e.g. "songs/foo/foo"); those path refs are filtered out *before* the
+    names are paired with their artists so the indices stay aligned.
     """
     try:
         raw = open(dta_path, 'rb').read()
         txt = _decode_text(raw)
     except OSError:
         return []
-    # findall on the backreference pattern returns (quote, value) tuples
-    names = [v for _q, v in SONG_NAME_RE.findall(txt)]
-    artists = [v for _q, v in SONG_ARTIST_RE.findall(txt)]
-    pairs = []
-    for i, n in enumerate(names):
-        # skip the `(song (name "songs/<id>/<id>"))` path references
-        if n.startswith('songs/'):
-            continue
-        a = artists[i] if i < len(artists) else ''
-        pairs.append((n.strip(), a.strip()))
-    return pairs
+    # findall on the backreference pattern returns (quote, value) tuples;
+    # drop the `(song (name "songs/<id>/<id>"))` path references first.
+    names = [v.strip() for _q, v in SONG_NAME_RE.findall(txt)
+             if not v.startswith('songs/')]
+    artists = [v.strip() for _q, v in SONG_ARTIST_RE.findall(txt)]
+    return [(n, a) for n, a in zip_longest(names, artists, fillvalue='') if n]
 
 
 def is_rock_band(game_id, title):
@@ -160,6 +197,11 @@ def is_rock_band(game_id, title):
     if title and title != '?':
         return any(kw in title.lower() for kw in RB_TITLE_KEYWORDS)
     return game_id in KNOWN_RB_IDS
+
+
+def original_game_name(game_id):
+    """Return the official/original name for a PS3 game id, or ''."""
+    return GAME_ID_ORIGINAL_NAMES.get(game_id, '')
 
 
 def classify_type(folder, songs, subdirs):
@@ -256,18 +298,27 @@ def send_to_recycle_bin(path):
 # GUI
 # ---------------------------------------------------------------------------
 class App:
-    def __init__(self, root, game_dir, show_all):
+    def __init__(self, root, game_dir):
         self.root = root
         self.game_dir = game_dir
-        self.only_rb = tk.BooleanVar(value=not show_all)
 
         self.item_by_path = {}   # path -> item dict
         self.game_nodes = {}     # game_id -> tree node id
         self.game_paths = {}     # game_id -> game folder path
         self.game_titles = {}    # game_id -> display title
         self.game_delete = {}    # game_id -> bool (mark whole game folder)
+        self.game_order = []     # game_id list in insertion order
+        self.game_items = {}     # game_id -> [item dicts] in tree order
         self.ui_queue = queue.Queue()
         self.scanning = False
+        # filters
+        self.search_var = tk.StringVar()
+        self.dup_only_var = tk.BooleanVar(value=False)
+        self._visible = set()    # tree nodes currently displayed
+        # duplicate navigation state (context menu -> Show duplicated items)
+        self.dup_cycle = []
+        self.dup_cycle_index = -1
+        self.dup_cycle_source = None
 
         self._build_ui()
         self.root.after(60, self._poll_queue)
@@ -289,10 +340,21 @@ class App:
         ttk.Button(top, text='Browse\u2026', command=self.browse_dir).pack(side='left')
         ttk.Button(top, text='Rescan', command=self.start_scan).pack(side='left', padx=(4, 0))
 
-        filt = ttk.Checkbutton(
-            top, text='Only Rock Band content', variable=self.only_rb,
-            command=self.start_scan)
-        filt.pack(side='left', padx=(10, 0))
+        # second toolbar row: search + duplication filter
+        tool2 = ttk.Frame(self.root, padding=(8, 0, 8, 4))
+        tool2.pack(fill='x')
+        ttk.Label(tool2, text='Search:').pack(side='left')
+        self.search_entry = ttk.Entry(
+            tool2, textvariable=self.search_var, width=42)
+        self.search_entry.pack(side='left', padx=(6, 0))
+        self.search_entry.bind('<KeyRelease>', self._on_search_change)
+        self.dup_only = ttk.Checkbutton(
+            tool2, text='Show duplications only', variable=self.dup_only_var,
+            command=self._apply_filters)
+        self.dup_only.pack(side='left', padx=(12, 0))
+        ttk.Label(
+            tool2, text='Yellow = song also found in another item',
+            foreground='#8a6d00').pack(side='left', padx=(12, 0))
 
         # -- tree ------------------------------------------------------------
         mid = ttk.Frame(self.root, padding=(8, 4, 8, 4))
@@ -325,6 +387,7 @@ class App:
         self.tree.tag_configure('nonrb', foreground='#8a8a8a')
         self.tree.tag_configure('empty', foreground='#b06a00')
         self.tree.tag_configure('even', background='#f4f4f4')
+        self.tree.tag_configure('dup', background='#ffe08a')
 
         self.tree.bind('<Button-1>', self._on_click)
         self.tree.bind('<Double-1>', self._on_double_click)
@@ -336,6 +399,8 @@ class App:
         self.menu.add_command(label='Open folder in Explorer', command=self._menu_open)
         self.menu.add_command(label='Delete entire game folder\u2026', command=self._menu_delete_game)
         self.menu.add_command(label='Toggle mark', command=self._menu_toggle)
+        self.menu.add_command(
+            label='Show duplicated items', command=self._menu_show_dups)
         self.menu.add_separator()
         self.menu.add_command(label='Select all', command=self.select_all)
         self.menu.add_command(label='Select none', command=self.select_none)
@@ -381,9 +446,8 @@ class App:
         self.marked_var.set('Marked: 0 items \u00b7 0 B')
         # capture Tk state on the main thread; never touch Tk vars from the worker
         game_dir = self.dir_var.get().strip().strip('"')
-        only_rb = bool(self.only_rb.get())
         threading.Thread(
-            target=self._scan_worker, args=(game_dir, only_rb), daemon=True).start()
+            target=self._scan_worker, args=(game_dir,), daemon=True).start()
 
     def _clear_tree(self):
         for node in self.tree.get_children():
@@ -393,8 +457,14 @@ class App:
         self.game_paths.clear()
         self.game_titles.clear()
         self.game_delete.clear()
+        self.game_order.clear()
+        self.game_items.clear()
+        self._visible.clear()
+        self.dup_cycle = []
+        self.dup_cycle_index = -1
+        self.dup_cycle_source = None
 
-    def _scan_worker(self, game_dir, only_rb):
+    def _scan_worker(self, game_dir):
         self.game_dir = game_dir
 
         try:
@@ -416,10 +486,12 @@ class App:
             sfo = parse_sfo(os.path.join(gpath, 'PARAM.SFO'))
             title = sfo.get('TITLE') or '?'
             rb = is_rock_band(gid, title)
-            if only_rb and not rb:
-                continue
+            if not rb:
+                continue  # only Rock Band content is shown
 
-            title_show = title
+            base_id = gid.upper().replace('CACHEDATA', '')
+            title_show = original_game_name(base_id) or (
+                title if title != '?' else '?')
             if 'CACHEDATA' in gid.upper():
                 title_show += ' (cache data)'
 
@@ -478,16 +550,19 @@ class App:
     # -- UI insert --------------------------------------------------------------
     def _add_game(self, gid, gpath, title, items, size_total, nsongs, rb):
         if items:
-            header = (f'\U0001f3b8 {title}  ({gid})  \u2014  {len(items)} items '
+            header = (f'{title}  ({gid})  \u2014  {len(items)} items '
                       f'\u00b7 {nsongs} songs \u00b7 {human_size(size_total)}')
         else:
-            header = f'\U0001f3b8 {title}  ({gid})  \u2014  no song content'
+            header = f'{title}  ({gid})  \u2014  no song content'
         tags = ['game'] + ([] if rb else ['nonrb']) + (['empty'] if not items else [])
         node = self.tree.insert('', 'end', text=header, values=('', '', '', ''), tags=tags)
         self.game_nodes[gid] = node
         self.game_titles[gid] = title
         self.game_paths[gid] = gpath
         self.game_delete[gid] = False
+        self.game_order.append(gid)
+        self.game_items[gid] = list(items)
+        self._visible.add(node)
 
         for i, item in enumerate(items):
             tags_i = ['content'] + ([] if item['rb'] else ['nonrb'])
@@ -498,7 +573,9 @@ class App:
             inode = self.tree.insert(node, 'end', text=item['folder'],
                                      values=values, tags=tags_i)
             item['node'] = inode
+            item['has_duplicates'] = False
             self.item_by_path[item['path']] = item
+            self._visible.add(inode)
 
         self.tree.item(node, open=True)
         self._update_game_mark(gid)
@@ -506,9 +583,15 @@ class App:
     def _scan_done(self, n_games):
         self.scanning = False
         self.del_btn.state(['!disabled'])
+        self._compute_duplicates()
+        self._apply_filters()
+        n_dup = sum(1 for it in self.item_by_path.values()
+                    if it.get('has_duplicates'))
+        dup_txt = (f' \u00b7 {n_dup} item(s) contain duplicated songs'
+                   if n_dup else '')
         self.status_var.set(
             f'Done. {n_games} game(s) listed \u2014 '
-            f'{len(self.item_by_path)} content item(s). '
+            f'{len(self.item_by_path)} content item(s){dup_txt}. '
             f'Deleted items go to the Windows Recycle Bin.')
         self._update_marked_summary()
 
@@ -604,6 +687,179 @@ class App:
         for it in self.item_by_path.values():
             grouped.setdefault(it['game_id'], []).append(it)
         return grouped
+
+    # -- duplication detection / filtering ------------------------------------
+    def _compute_duplicates(self):
+        """Mark items whose songs also appear in another item (yellow).
+
+        A song counts as duplicated when the same (artist, name) pair is
+        found in two or more items - e.g. inside a track pack AND as a
+        standalone DLC item.
+        """
+        song_items = {}  # (artist, name) -> set of item paths
+        for it in self.item_by_path.values():
+            seen = set()
+            for name, artist in it['songs']:
+                name = name.strip().lower()
+                if not name:
+                    continue
+                seen.add((artist.strip().lower(), name))
+            for key in seen:
+                song_items.setdefault(key, set()).add(it['path'])
+        dup_paths = set()
+        for paths in song_items.values():
+            if len(paths) > 1:
+                dup_paths.update(paths)
+        for it in self.item_by_path.values():
+            it['has_duplicates'] = it['path'] in dup_paths
+        self._apply_dup_tags()
+
+    def _apply_dup_tags(self):
+        for gid, items in self.game_items.items():
+            for i, it in enumerate(items):
+                tags = ['content'] + ([] if it['rb'] else ['nonrb'])
+                if i % 2:
+                    tags.append('even')
+                if it.get('has_duplicates'):
+                    tags.append('dup')
+                self.tree.item(it['node'], tags=tags)
+
+    def _make_search_text(self, it, game_title):
+        parts = [it['folder']]
+        if game_title:
+            parts.append(game_title)
+        for name, artist in it['songs']:
+            parts.append(name)
+            if artist:
+                parts.append(artist)
+                parts.append(f'{artist} - {name}')
+        return ' '.join(parts).lower()
+
+    def _item_search_text(self, it):
+        s = it.get('_search')
+        if s is None:
+            s = self._make_search_text(
+                it, self.game_titles.get(it['game_id'], ''))
+            it['_search'] = s
+        return s
+
+    def _item_matches(self, it, q):
+        return q in self._item_search_text(it)
+
+    def _game_matches(self, gid, q):
+        if not q:
+            return True
+        text = f'{gid} {self.game_titles.get(gid, "")}'.lower()
+        return q in text
+
+    def _on_search_change(self, _event=None):
+        self._apply_filters()
+
+    def _apply_filters(self):
+        """Show/hide tree rows based on the search box and dup-only filter."""
+        if self.scanning:
+            return
+        q = self.search_var.get().strip().lower()
+        dup_only = bool(self.dup_only_var.get())
+
+        want = []  # ordered (gid, visible_items)
+        for gid in self.game_order:
+            items = self.game_items.get(gid, [])
+            if not items:
+                if q and not self._game_matches(gid, q):
+                    continue
+                want.append((gid, []))
+            else:
+                vis = [it for it in items
+                       if (not dup_only or it.get('has_duplicates'))
+                       and (not q or self._item_matches(it, q))]
+                if vis:
+                    want.append((gid, vis))
+
+        wanted_nodes = set()
+        for gid, vis in want:
+            wanted_nodes.add(self.game_nodes[gid])
+            for it in vis:
+                wanted_nodes.add(it['node'])
+        for node in list(self._visible):
+            if node not in wanted_nodes:
+                self.tree.detach(node)
+                self._visible.discard(node)
+
+        idx = 0
+        for gid, vis in want:
+            gnode = self.game_nodes[gid]
+            if gnode not in self._visible:
+                self.tree.reattach(gnode, '', idx)
+                self._visible.add(gnode)
+            idx += 1
+            for it in vis:
+                inode = it['node']
+                if inode not in self._visible:
+                    self.tree.reattach(inode, gnode, 'end')
+                    self._visible.add(inode)
+
+    def _select_and_see(self, node):
+        if node not in self._visible:
+            return
+        self.tree.see(node)
+        self.tree.focus(node)
+        self.tree.selection_set(node)
+
+    def _menu_show_dups(self):
+        """Context menu: jump through the items sharing this item's songs.
+
+        Each click selects the next duplicate partner; re-clicking cycles
+        through all of them.
+        """
+        node = getattr(self, '_menu_node', None)
+        gid = self._node_game_id(node)
+        if gid and node in self.game_nodes.values():
+            source_items = [it for it in self.item_by_path.values()
+                            if it['game_id'] == gid]
+        else:
+            item = self._node_item(node)
+            source_items = [item] if item else []
+        if not source_items:
+            return
+
+        source_keys = set()
+        for it in source_items:
+            for name, artist in it['songs']:
+                name = name.strip().lower()
+                if not name:
+                    continue
+                source_keys.add((artist.strip().lower(), name))
+
+        source_paths = {it['path'] for it in source_items}
+        targets = []
+        for it in self.item_by_path.values():
+            if it['path'] in source_paths:
+                continue
+            for name, artist in it['songs']:
+                if (artist.strip().lower(), name.strip().lower()) in source_keys:
+                    targets.append(it)
+                    break
+        if not targets:
+            messagebox.showinfo(
+                'No duplicates',
+                'This item\u2019s songs do not appear in any other item.')
+            return
+
+        # make everything visible so the duplicates can be jumped to
+        if self.search_var.get():
+            self.search_var.set('')
+        if self.dup_only_var.get():
+            self.dup_only_var.set(False)
+        self._apply_filters()
+
+        src = source_items[0]['path'] if len(source_items) == 1 else f'GAME:{gid}'
+        if self.dup_cycle_source != src:
+            self.dup_cycle = targets
+            self.dup_cycle_index = -1
+            self.dup_cycle_source = src
+        self.dup_cycle_index = (self.dup_cycle_index + 1) % len(self.dup_cycle)
+        self._select_and_see(self.dup_cycle[self.dup_cycle_index]['node'])
 
     def _update_marked_summary(self):
         marked = [it for it in self.item_by_path.values() if it['marked']]
@@ -754,7 +1010,6 @@ class App:
 def main():
     args = sys.argv[1:]
     game_dir = GAME_DIR_DEFAULT
-    show_all = False
     i = 0
     while i < len(args):
         a = args[i]
@@ -762,8 +1017,6 @@ def main():
             i += 1
             if i < len(args):
                 game_dir = os.path.abspath(args[i])
-        elif a == '--show-all':
-            show_all = True
         i += 1
 
     if tk is None:
@@ -772,7 +1025,7 @@ def main():
 
     root = tk.Tk()
     if os.path.isdir(game_dir):
-        app = App(root, game_dir, show_all)
+        app = App(root, game_dir)
     else:
         # let the user pick a folder
         chosen = filedialog.askdirectory(
@@ -781,7 +1034,7 @@ def main():
         if not chosen:
             root.destroy()
             return 0
-        app = App(root, chosen, show_all)
+        app = App(root, chosen)
     root.mainloop()
     return 0
 
