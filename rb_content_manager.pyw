@@ -20,6 +20,7 @@ import re
 import struct
 import sys
 import threading
+import time
 from itertools import zip_longest
 
 # tkinter is bundled with the standard Windows CPython build
@@ -110,6 +111,17 @@ KNOWN_RB_IDS = set(GAME_ID_ORIGINAL_NAMES) | {
 SONG_NAME_RE = re.compile(r"\(\s*'?name'?\s+([\"'])(.*?)\1")
 SONG_ARTIST_RE = re.compile(r"\(\s*'?artist'?\s+([\"'])(.*?)\1")
 
+# Human heading for each column (used to restore the text after a sort
+# arrow is removed, and to re-add arrows when re-sorting).
+COLUMN_HEADINGS = {
+    '#0': 'Content',
+    'marked': 'Mark',
+    'type': 'Type',
+    'songs': 'Song(s)',
+    'date': 'Date modified',
+    'size': 'Size',
+}
+
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
@@ -166,12 +178,14 @@ def _decode_text(raw):
     return raw.decode('cp1252', errors='replace')
 
 
-def read_dta_songs(dta_path):
-    """Extract [(name, artist), ...] pairs from a Songs.dta file.
+def read_dta_songs_detail(dta_path):
+    """Extract [{name, artist, folder}, ...] from a Songs.dta file.
 
-    The `(name "...")` token also appears for the song file path
-    (e.g. "songs/foo/foo"); those path refs are filtered out *before* the
-    names are paired with their artists so the indices stay aligned.
+    `name`/`artist` are the display values; `folder` is the song folder
+    reference written in the dta (e.g. 'songs/radiator/radiator') or ''
+    when it cannot be determined. The `(name "songs/...")` path refs are
+    matched back to the display names by order (the same assumption the
+    original name/artist pairing relies on), so the lists stay aligned.
     """
     try:
         raw = open(dta_path, 'rb').read()
@@ -179,11 +193,29 @@ def read_dta_songs(dta_path):
     except OSError:
         return []
     # findall on the backreference pattern returns (quote, value) tuples;
-    # drop the `(song (name "songs/<id>/<id>"))` path references first.
-    names = [v.strip() for _q, v in SONG_NAME_RE.findall(txt)
-             if not v.startswith('songs/')]
+    # the `(song (name "songs/<id>/<id>"))` path refs are separated from the
+    # real display names *before* either is paired with the artists.
+    names = []
+    folders = []
+    for _q, v in SONG_NAME_RE.findall(txt):
+        v = v.strip()
+        if v.startswith('songs/'):
+            folders.append(v)
+        else:
+            names.append(v)
     artists = [v.strip() for _q, v in SONG_ARTIST_RE.findall(txt)]
-    return [(n, a) for n, a in zip_longest(names, artists, fillvalue='') if n]
+    if len(folders) != len(names):
+        folders = [''] * len(names)  # can't align reliably; drop folder info
+    out = []
+    for i, (n, a) in enumerate(zip_longest(names, artists, fillvalue='')):
+        if not n:
+            continue
+        out.append({
+            'name': n,
+            'artist': a,
+            'folder': folders[i] if i < len(folders) else '',
+        })
+    return out
 
 
 def is_rock_band(game_id, title):
@@ -253,6 +285,13 @@ def human_size(num):
     return f'{num:.1f} TB'
 
 
+def format_mtime(ts):
+    """Format a modified timestamp as 'YY-MM-DD HH:MM' (local time)."""
+    if not ts:
+        return ''
+    return time.strftime('%y-%m-%d %H:%M', time.localtime(ts))
+
+
 def send_to_recycle_bin(path):
     """Move a file/folder to the Windows Recycle Bin (reversible delete).
 
@@ -315,10 +354,15 @@ class App:
         self.search_var = tk.StringVar()
         self.dup_only_var = tk.BooleanVar(value=False)
         self._visible = set()    # tree nodes currently displayed
-        # duplicate navigation state (context menu -> Show duplicated items)
-        self.dup_cycle = []
-        self.dup_cycle_index = -1
-        self.dup_cycle_source = None
+        # duplicate-filter state (context menu -> Show duplicated items)
+        self.dup_filter_paths = None   # item paths to show, or None = show all
+        self.dup_filter_source = ''    # short label describing the active filter
+        # 'See all songs' view state (view-only; songs can't be deleted)
+        self.song_filter = None        # {'item', 'rows'} or None
+        self._menu_song_idx = None     # dynamic context-menu entry index
+        # column sorting state (None = default insertion order)
+        self.sort_col = None
+        self.sort_reverse = False
 
         self._build_ui()
         self.root.after(60, self._poll_queue)
@@ -352,6 +396,10 @@ class App:
             tool2, text='Show duplications only', variable=self.dup_only_var,
             command=self._apply_filters)
         self.dup_only.pack(side='left', padx=(12, 0))
+        self.dup_clear_btn = ttk.Button(
+            tool2, text='\u2715 Show all', command=self.clear_dup_filter,
+            state='disabled')
+        self.dup_clear_btn.pack(side='left', padx=(8, 0))
         ttk.Label(
             tool2, text='Yellow = song also found in another item',
             foreground='#8a6d00').pack(side='left', padx=(12, 0))
@@ -360,17 +408,25 @@ class App:
         mid = ttk.Frame(self.root, padding=(8, 4, 8, 4))
         mid.pack(fill='both', expand=True)
 
-        cols = ('marked', 'type', 'songs', 'size')
+        cols = ('marked', 'type', 'songs', 'date', 'size')
         self.tree = ttk.Treeview(mid, columns=cols, selectmode='browse')
-        self.tree.heading('#0', text='Content', anchor='w')
+        self.tree.heading('#0', text='Content', anchor='w',
+                          command=lambda: self._toggle_sort('#0'))
         self.tree.column('#0', width=320, minwidth=170, anchor='w')
-        self.tree.heading('marked', text='Mark')
+        self.tree.heading('marked', text='Mark',
+                          command=lambda: self._toggle_sort('marked'))
         self.tree.column('marked', width=48, minwidth=42, anchor='center', stretch=False)
-        self.tree.heading('type', text='Type')
+        self.tree.heading('type', text='Type',
+                          command=lambda: self._toggle_sort('type'))
         self.tree.column('type', width=96, minwidth=72, anchor='w', stretch=False)
-        self.tree.heading('songs', text='Song(s)', anchor='w')
-        self.tree.column('songs', width=560, minwidth=200, anchor='w')
-        self.tree.heading('size', text='Size')
+        self.tree.heading('songs', text='Song(s)', anchor='w',
+                          command=lambda: self._toggle_sort('songs'))
+        self.tree.column('songs', width=440, minwidth=180, anchor='w')
+        self.tree.heading('date', text='Date modified',
+                          command=lambda: self._toggle_sort('date'))
+        self.tree.column('date', width=120, minwidth=92, anchor='w')
+        self.tree.heading('size', text='Size',
+                          command=lambda: self._toggle_sort('size'))
         self.tree.column('size', width=90, minwidth=70, anchor='e', stretch=False)
 
         vsb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
@@ -388,6 +444,7 @@ class App:
         self.tree.tag_configure('empty', foreground='#b06a00')
         self.tree.tag_configure('even', background='#f4f4f4')
         self.tree.tag_configure('dup', background='#ffe08a')
+        self.tree.tag_configure('song', foreground='#1f4e79')
 
         self.tree.bind('<Button-1>', self._on_click)
         self.tree.bind('<Double-1>', self._on_double_click)
@@ -460,9 +517,17 @@ class App:
         self.game_order.clear()
         self.game_items.clear()
         self._visible.clear()
-        self.dup_cycle = []
-        self.dup_cycle_index = -1
-        self.dup_cycle_source = None
+        self.dup_filter_paths = None
+        self.dup_filter_source = ''
+        self.song_filter = None
+        if self._menu_song_idx is not None:
+            self.menu.delete(self._menu_song_idx)
+            self._menu_song_idx = None
+        self._update_dup_filter_button()
+        if self.sort_col is not None:
+            self.tree.heading(self.sort_col, text=COLUMN_HEADINGS[self.sort_col])
+        self.sort_col = None
+        self.sort_reverse = False
 
     def _scan_worker(self, game_dir):
         self.game_dir = game_dir
@@ -526,13 +591,18 @@ class App:
 
     def _build_item(self, gid, title, folder, fp, rb):
         subdirs = [d for d in os.listdir(fp) if os.path.isdir(os.path.join(fp, d))]
-        pairs = []
+        details = []
         for cand in (os.path.join(fp, 'songs', 'songs.dta'),
                      os.path.join(fp, 'songs.dta')):
             if os.path.isfile(cand):
-                pairs = read_dta_songs(cand)
-                if pairs:
+                details = read_dta_songs_detail(cand)
+                if details:
                     break
+        pairs = [(d['name'], d['artist']) for d in details]
+        try:
+            mtime = os.path.getmtime(fp)
+        except OSError:
+            mtime = 0
         item = {
             'path': fp,
             'game_id': gid,
@@ -540,7 +610,9 @@ class App:
             'folder': folder,
             'type': classify_type(folder, pairs, subdirs),
             'songs': pairs,
+            'song_details': details,
             'size': folder_size(fp),
+            'mtime': mtime,
             'marked': False,
             'node': None,
             'rb': rb,
@@ -555,7 +627,7 @@ class App:
         else:
             header = f'{title}  ({gid})  \u2014  no song content'
         tags = ['game'] + ([] if rb else ['nonrb']) + (['empty'] if not items else [])
-        node = self.tree.insert('', 'end', text=header, values=('', '', '', ''), tags=tags)
+        node = self.tree.insert('', 'end', text=header, values=('', '', '', '', ''), tags=tags)
         self.game_nodes[gid] = node
         self.game_titles[gid] = title
         self.game_paths[gid] = gpath
@@ -569,7 +641,8 @@ class App:
             if i % 2:
                 tags_i.append('even')
             song_text = songs_preview(item['songs'])
-            values = ('\u2610', item['type'], song_text, human_size(item['size']))
+            values = ('\u2610', item['type'], song_text,
+                      format_mtime(item['mtime']), human_size(item['size']))
             inode = self.tree.insert(node, 'end', text=item['folder'],
                                      values=values, tags=tags_i)
             item['node'] = inode
@@ -601,7 +674,18 @@ class App:
             return
         node = self.tree.identify_row(event.y)
         col = self.tree.identify_column(event.x)
-        if not node or col != '#1':  # only the Mark column toggles
+        if not node:
+            return
+        row = self._node_song_row(node)
+        if row:
+            # songs are view-only: clicking one jumps straight to its folder
+            if col != '#1' and row['folder']:
+                try:
+                    os.startfile(row['folder'])  # noqa: S606 - open song folder
+                except OSError as e:
+                    messagebox.showerror('Open folder', str(e))
+            return
+        if col != '#1':  # only the Mark column toggles
             return
         if node in self.game_nodes.values():
             self._toggle_game(node)
@@ -657,6 +741,85 @@ class App:
         vals = list(self.tree.item(node, 'values'))
         vals[0] = sym
         self.tree.item(node, values=vals)
+
+    # -- column sorting -------------------------------------------------------
+    def _toggle_sort(self, col):
+        """Sort by `col`; clicking the active column flips the direction."""
+        if self.scanning or col not in COLUMN_HEADINGS:
+            return
+        if self.sort_col == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            if self.sort_col is not None:
+                self.tree.heading(self.sort_col, text=COLUMN_HEADINGS[self.sort_col])
+            self.sort_col = col
+            self.sort_reverse = False
+        self.tree.heading(col, text=(
+            f'{COLUMN_HEADINGS[col]} \u25b2' if not self.sort_reverse
+            else f'{COLUMN_HEADINGS[col]} \u25bc'))
+        self._apply_sort()
+
+    def _apply_sort(self):
+        """Re-apply the current sort to game headers and item rows."""
+        if self.sort_col is None:
+            return
+        # reorder game headers
+        self.game_order.sort(key=self._game_sort_key, reverse=self.sort_reverse)
+        idx = 0
+        for gid in self.game_order:
+            gnode = self.game_nodes[gid]
+            if gnode in self._visible:
+                self.tree.move(gnode, '', idx)
+                idx += 1
+        # reorder the item rows inside each game
+        for gid in self.game_order:
+            items = self.game_items[gid]
+            items.sort(key=self._item_sort_key, reverse=self.sort_reverse)
+            gnode = self.game_nodes[gid]
+            idx = 0
+            for it in items:
+                if it['node'] in self._visible:
+                    self.tree.move(it['node'], gnode, idx)
+                    idx += 1
+        self._apply_dup_tags()
+
+    def _item_sort_key(self, it):
+        col = self.sort_col
+        if col == '#0':
+            return (it['folder'] or '').lower()
+        if col == 'marked':
+            return bool(it['marked'])
+        if col == 'type':
+            return it['type'] or ''
+        if col == 'songs':
+            return (len(it['songs']), songs_preview(it['songs']).lower())
+        if col == 'date':
+            return it.get('mtime', 0)
+        if col == 'size':
+            return it['size']
+        return 0
+
+    def _game_sort_key(self, gid):
+        col = self.sort_col
+        items = self.game_items.get(gid, [])
+        if col == '#0':
+            return (self.game_titles.get(gid, gid) or '').lower()
+        if col == 'marked':
+            return bool(items) and any(it['marked'] for it in items)
+        if col == 'type':
+            return ''
+        if col == 'songs':
+            return sum(len(it['songs']) for it in items)
+        if col == 'date':
+            if items:
+                return max(it.get('mtime', 0) for it in items)
+            try:
+                return os.path.getmtime(self.game_paths[gid])
+            except OSError:
+                return 0
+        if col == 'size':
+            return sum(it['size'] for it in items)
+        return 0
 
     def select_all(self):
         for it in self.item_by_path.values():
@@ -756,23 +919,32 @@ class App:
         self._apply_filters()
 
     def _apply_filters(self):
-        """Show/hide tree rows based on the search box and dup-only filter."""
+        """Show/hide tree rows based on search, dup-only toggle and dup filter."""
         if self.scanning:
             return
         q = self.search_var.get().strip().lower()
         dup_only = bool(self.dup_only_var.get())
+        dup_paths = self.dup_filter_paths
 
         want = []  # ordered (gid, visible_items)
         for gid in self.game_order:
             items = self.game_items.get(gid, [])
             if not items:
+                if dup_paths is not None:
+                    continue
                 if q and not self._game_matches(gid, q):
                     continue
                 want.append((gid, []))
             else:
-                vis = [it for it in items
-                       if (not dup_only or it.get('has_duplicates'))
-                       and (not q or self._item_matches(it, q))]
+                vis = []
+                for it in items:
+                    if dup_paths is not None and it['path'] not in dup_paths:
+                        continue
+                    if dup_only and not it.get('has_duplicates'):
+                        continue
+                    if q and not self._item_matches(it, q):
+                        continue
+                    vis.append(it)
                 if vis:
                     want.append((gid, vis))
 
@@ -781,6 +953,9 @@ class App:
             wanted_nodes.add(self.game_nodes[gid])
             for it in vis:
                 wanted_nodes.add(it['node'])
+        if self.song_filter is not None:
+            for r in self.song_filter['rows']:
+                wanted_nodes.add(r['node'])
         for node in list(self._visible):
             if node not in wanted_nodes:
                 self.tree.detach(node)
@@ -799,19 +974,13 @@ class App:
                     self.tree.reattach(inode, gnode, 'end')
                     self._visible.add(inode)
 
-    def _select_and_see(self, node):
-        if node not in self._visible:
-            return
-        self.tree.see(node)
-        self.tree.focus(node)
-        self.tree.selection_set(node)
-
     def _menu_show_dups(self):
-        """Context menu: jump through the items sharing this item's songs.
+        """Context menu: filter the list to only the duplicated group.
 
-        Each click selects the next duplicate partner; re-clicking cycles
-        through all of them.
+        Shows the selected item(s) plus every item that contains any of their
+        songs. The '\u2715 Show all' button clears the filter.
         """
+        self._clear_song_rows()
         node = getattr(self, '_menu_node', None)
         gid = self._node_game_id(node)
         if gid and node in self.game_nodes.values():
@@ -832,34 +1001,143 @@ class App:
                 source_keys.add((artist.strip().lower(), name))
 
         source_paths = {it['path'] for it in source_items}
-        targets = []
+        group_paths = set(source_paths)
         for it in self.item_by_path.values():
             if it['path'] in source_paths:
                 continue
             for name, artist in it['songs']:
                 if (artist.strip().lower(), name.strip().lower()) in source_keys:
-                    targets.append(it)
+                    group_paths.add(it['path'])
                     break
-        if not targets:
+
+        if len(group_paths) <= len(source_paths):
             messagebox.showinfo(
                 'No duplicates',
                 'This item\u2019s songs do not appear in any other item.')
             return
 
-        # make everything visible so the duplicates can be jumped to
+        # the dup filter takes over the view: clear any active search text
+        if self.search_var.get():
+            self.search_var.set('')
+
+        if len(source_items) == 1 and source_items[0]['songs']:
+            n, a = source_items[0]['songs'][0]
+            label = f'{a} - {n}' if a else n
+        else:
+            label = self.game_titles.get(gid, gid)
+        self.dup_filter_paths = group_paths
+        self.dup_filter_source = label
+        self._update_dup_filter_button()
+        self._apply_filters()
+        self.status_var.set(
+            f'Showing {len(group_paths)} item(s) that share songs with '
+            f'"{label}". Click "\u2715 Show all" to clear the filter.')
+
+    def clear_dup_filter(self):
+        """Remove the duplicate/song filter and show everything again."""
+        self.dup_filter_paths = None
+        self.dup_filter_source = ''
+        self._clear_song_rows()
+        self._update_dup_filter_button()
+        self._apply_filters()
+        self.status_var.set('Showing all items.')
+
+    def _update_dup_filter_button(self):
+        """Enable/disable the '\u2715 Show all' button with the filter state."""
+        if self.dup_filter_paths or self.song_filter is not None:
+            self.dup_clear_btn.state(['!disabled'])
+            if self.song_filter is not None:
+                self.dup_clear_btn.configure(text='\u2715 Show all (songs)')
+            else:
+                self.dup_clear_btn.configure(
+                    text=f'\u2715 Show all ({self.dup_filter_source})')
+        else:
+            self.dup_clear_btn.state(['disabled'])
+            self.dup_clear_btn.configure(text='\u2715 Show all')
+
+    def _menu_see_all_songs(self):
+        """Context menu: filter the view to just this item's songs.
+
+        The source item's songs are listed as child rows (view only - songs
+        cannot be deleted, deleting a song inside a pack breaks the pack).
+        Clicking a song opens its folder; '\u2715 Show all' clears the view.
+        """
+        item = self._node_item(getattr(self, '_menu_node', None))
+        if not item or len(item['songs']) < 2:
+            return
+
+        self._clear_song_rows()
+        self.dup_filter_paths = {item['path']}  # show only this item
+        self.dup_filter_source = ''
         if self.search_var.get():
             self.search_var.set('')
         if self.dup_only_var.get():
             self.dup_only_var.set(False)
-        self._apply_filters()
 
-        src = source_items[0]['path'] if len(source_items) == 1 else f'GAME:{gid}'
-        if self.dup_cycle_source != src:
-            self.dup_cycle = targets
-            self.dup_cycle_index = -1
-            self.dup_cycle_source = src
-        self.dup_cycle_index = (self.dup_cycle_index + 1) % len(self.dup_cycle)
-        self._select_and_see(self.dup_cycle[self.dup_cycle_index]['node'])
+        details = item.get('song_details', [])
+        # Only trust the per-song folder mapping when the dta path refs line
+        # up with the real song subfolders; otherwise open the songs/ dir.
+        songs_dir = os.path.join(item['path'], 'songs')
+        if os.path.isdir(songs_dir):
+            actual = {d for d in os.listdir(songs_dir)
+                      if os.path.isdir(os.path.join(songs_dir, d))}
+        else:
+            actual = set()
+        pathref_ids = set()
+        for d in details:
+            parts = d.get('folder', '').replace('\\', '/').split('/')
+            if len(parts) >= 2 and parts[0] == 'songs':
+                pathref_ids.add(parts[1])
+        trust_folders = bool(actual) and pathref_ids == actual
+
+        rows = []
+        for i, d in enumerate(details):
+            if trust_folders and d.get('folder'):
+                folder = os.path.join(item['path'], d['folder'])
+                if not os.path.isdir(folder):
+                    folder = songs_dir
+            else:
+                folder = songs_dir if os.path.isdir(songs_dir) else item['path']
+            label = f'{d["artist"]} - {d["name"]}' if d['artist'] else d['name']
+            mtime = ''
+            try:
+                mtime = format_mtime(os.path.getmtime(folder))
+            except OSError:
+                pass
+            tags = ['song'] + (['even'] if i % 2 else [])
+            text = os.path.basename(folder) if folder else d['name']
+            row = self.tree.insert(
+                item['node'], 'end', text=text,
+                values=('', 'Song', label, mtime, ''), tags=tags)
+            rows.append({'node': row, 'folder': folder, 'label': label})
+            self._visible.add(row)
+
+        self.song_filter = {'item': item, 'rows': rows}
+        self.tree.item(item['node'], open=True)
+        self._update_dup_filter_button()
+        self._apply_filters()
+        self.status_var.set(
+            f'Showing {len(rows)} song(s) from "{item["folder"]}". '
+            'Click a song to open its folder; '
+            '"\u2715 Show all" clears the view.')
+
+    def _clear_song_rows(self):
+        """Delete the temporary song rows of the active 'See all songs' view."""
+        if self.song_filter is None:
+            return
+        for r in self.song_filter['rows']:
+            self._visible.discard(r['node'])
+            self.tree.delete(r['node'])
+        self.song_filter = None
+
+    def _node_song_row(self, node):
+        """Return the song-row dict for a tree node, or None."""
+        if self.song_filter is None:
+            return None
+        for r in self.song_filter['rows']:
+            if r['node'] == node:
+                return r
+        return None
 
     def _update_marked_summary(self):
         marked = [it for it in self.item_by_path.values() if it['marked']]
@@ -926,6 +1204,15 @@ class App:
 
     def _on_double_click(self, event):
         node = self.tree.identify_row(event.y)
+        if not node:
+            return
+        row = self._node_song_row(node)
+        if row and row['folder']:
+            try:
+                os.startfile(row['folder'])  # noqa: S606 - open song folder
+            except OSError as e:
+                messagebox.showerror('Open folder', str(e))
+            return
         item = next((it for it in self.item_by_path.values() if it['node'] == node), None)
         if item:
             try:
@@ -938,6 +1225,16 @@ class App:
         if node:
             self.tree.selection_set(node)
         self._menu_node = node
+        # (re)build the dynamic 'See all songs' entry for multi-song items
+        if self._menu_song_idx is not None:
+            self.menu.delete(self._menu_song_idx)
+            self._menu_song_idx = None
+        item = self._node_item(node)
+        if item and len(item['songs']) > 1:
+            self._menu_song_idx = 4
+            self.menu.insert(
+                self._menu_song_idx, 'command',
+                label='See all songs', command=self._menu_see_all_songs)
         try:
             self.menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -955,6 +1252,13 @@ class App:
 
     def _menu_open(self):
         node = getattr(self, '_menu_node', None)
+        row = self._node_song_row(node)
+        if row and row['folder']:
+            try:
+                os.startfile(row['folder'])  # noqa: S606 - open song folder
+            except OSError as e:
+                messagebox.showerror('Open folder', str(e))
+            return
         gid = self._node_game_id(node)
         if gid:
             try:
